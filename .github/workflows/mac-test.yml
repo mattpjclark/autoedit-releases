@@ -1,0 +1,112 @@
+name: Mac install test
+
+# Installs a release's Mac build on an Apple silicon and an Intel Mac, the way
+# a freelancer would, then checks the AI models, the app window, the test
+# suite and the in-app update path.  Run it from the Actions tab (or
+# `gh workflow run mac-test.yml -f tag=v0.3.0`) before making a release latest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            name: Apple silicon (macOS 15)
+          - runner: macos-15-intel
+            name: Intel (macOS 15)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      INST: /Users/runner/Library/Application Support/AutoEdit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the Mac setup, update and test bundle
+        run: |
+          mkdir dl && cd dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'AutoEdit-Setup-Mac-*.zip' --pattern 'AutoEdit-Update-Mac-*.zip' \
+            --pattern 'autoedit-tests-*.zip' --pattern 'autoedit-latest.json'
+          ls -la
+          uname -m; sw_vers
+
+      - name: Unpack like Finder does (ditto keeps permissions)
+        run: |
+          cd dl
+          ditto -x -k AutoEdit-Setup-Mac-*.zip setup
+          ls -l setup/AutoEdit-Setup-Mac
+          test -x "setup/AutoEdit-Setup-Mac/Install AutoEdit.command"
+
+      - name: Install (Install AutoEdit.command)
+        env:
+          AUTOEDIT_NO_LAUNCH: "1"
+        run: |
+          time "dl/setup/AutoEdit-Setup-Mac/Install AutoEdit.command" < /dev/null
+          cat "$INST/install.json"
+          ls -l ~/Applications/AutoEdit.app/Contents/MacOS ~/Applications/AutoEdit.app/Contents/Resources
+          plutil -lint ~/Applications/AutoEdit.app/Contents/Info.plist
+
+      - name: Smoke test (models from the install, no downloads)
+        run: '"$INST/venv/bin/python" .github/mac_smoke.py'
+
+      - name: Open AutoEdit.app
+        run: |
+          open ~/Applications/AutoEdit.app
+          sleep 60
+          echo "--- processes"; pgrep -fl "autoedit.app" || true
+          echo "--- app.log"; tail -60 ~/AutoEdit/app.log || true
+          pgrep -f "autoedit.app" > /dev/null || { echo "AutoEdit is not running"; exit 1; }
+          if grep -q "Traceback" ~/AutoEdit/app.log; then echo "errors in app.log"; exit 1; fi
+          screencapture -x screenshot.png || true
+          pkill -f "autoedit.app" || true
+
+      - name: Screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ matrix.runner }}
+          path: screenshot.png
+          if-no-files-found: ignore
+
+      - name: Test suite
+        run: |
+          "$INST/bin/uv" pip install --python "$INST/venv/bin/python" pytest -q
+          mkdir suite && cd suite && unzip -q ../dl/autoedit-tests-*.zip
+          # the two updater tests that expect a developer checkout do not apply to an install
+          TORCH_HOME="$INST/models" "$INST/venv/bin/python" -m pytest tests -q -p no:cacheprovider \
+            -k "not developer_checkout and not refuses_dev_copies"
+
+      - name: In-app update path
+        env:
+          AUTOEDIT_NO_LAUNCH: "1"
+        run: |
+          # what AutoEdit's Update button does: read the manifest, fetch + verify + unpack the Mac zip
+          "$INST/venv/bin/python" - <<'PY'
+          import pathlib, subprocess
+          from autoedit.updater import PLATFORM, check, install_dir, stage
+          assert PLATFORM == "mac"
+          info = check("dl", current="0.0.1")
+          print(info)
+          assert info.available and "Mac" in info.file_location
+          setup = stage(info)
+          print("staged at", setup, "install dir", install_dir())
+          assert (setup / "install.sh").is_file() and install_dir() is not None
+          subprocess.run(["/bin/bash", str(setup / "install.sh"), "--install-dir", str(install_dir()), "--update"],
+                         check=True, stdin=subprocess.DEVNULL)
+          PY
+          cat "$INST/install.json"
+          "$INST/venv/bin/python" -c "import autoedit; print('after update', autoedit.__version__)"
